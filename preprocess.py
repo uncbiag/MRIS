@@ -2,7 +2,7 @@ import os
 import numpy as np
 import pydicom as dicom
 from ast import literal_eval
-import scipy.ndimage as ndimage
+from monai.transforms import *
 from skimage.transform import resize
 
 
@@ -55,29 +55,14 @@ def name2folder(name):
     return folder
 
 
-def read_erode_mask():
-    mask_folder = '/playpen-raid/bqchen/code/OAIRetrieval/data/'
-    mask_path = [os.path.join(mask_folder, 'FC_2d_newseg.npy'), os.path.join(mask_folder, 'TC_2d_newseg.npy')]
-    thickness_mask = []
-    for path in mask_path:
-        thickness = np.load(path)
-        thickness[~np.isnan(thickness)] = 1
-        thickness[np.isnan(thickness)] = 0
-        thickness = ndimage.binary_erosion(thickness, structure=np.ones((15, 15))).astype(thickness.dtype)
-        thickness_mask.append(thickness)
-    return thickness_mask
-
-
-def read_thickness(data_folder, name, replace_nan=True):
+def read_thickness(data_folder, data_name, replace_nan=True):
     # read the thickness map given image name
-    single_image = False
-    if not isinstance(name, list):      # only read one thickness map
-        single_image = True
-        name = [name]
+    if not isinstance(data_name, list):      # only read one thickness map
+        data_name = [data_name]
 
     all_fc_map, all_tc_map = [], []
-    for n in name:
-        folder = name2folder(n)
+    for name in data_name:
+        folder = name2folder(name)
         fc_map = np.load(os.path.join(data_folder, folder, 'avsm/FC_2d_thickness.npy'))
         tc_map = np.load(os.path.join(data_folder, folder, 'avsm/TC_2d_thickness.npy'))
         if replace_nan:
@@ -86,29 +71,20 @@ def read_thickness(data_folder, name, replace_nan=True):
         all_fc_map.append(fc_map)
         all_tc_map.append(tc_map)
 
-    if single_image:
-        return all_fc_map[0], all_tc_map[0]
+    if len(data_name) == 1:
+        all_fc_map = all_fc_map[0]
+        all_tc_map = all_tc_map[0]
+
     return all_fc_map, all_tc_map
 
 
-def read_smooth_thickness(data_folder, name, smooth=True, replace_nan=True):
-    if smooth:
-        value = 0 if replace_nan else np.nan
-        mask_fc_thickness, mask_tc_thickness = read_thickness(data_folder, name, replace_nan=False)
-        query_fc_thickness, query_tc_thickness = read_thickness(data_folder, name, replace_nan=True)
-        query_fc_thickness = ndimage.gaussian_filter(query_fc_thickness, sigma=7, order=0)
-        query_tc_thickness = ndimage.gaussian_filter(query_tc_thickness, sigma=7, order=0)
-        query_fc_thickness = np.where(np.isnan(mask_fc_thickness), value, query_fc_thickness)
-        query_tc_thickness = np.where(np.isnan(mask_tc_thickness), value, query_tc_thickness)
-    else:
-        query_fc_thickness, query_tc_thickness = read_thickness(data_folder, name, replace_nan=replace_nan)
-    return query_fc_thickness, query_tc_thickness
-
-
-def normalize(img, percentage_clip=99, zero_centered=False):
+def normalize(img, percentage_clip=-1, max_value=-1, zero_centered=False):
     # normalize into [0, 1] if not zero_centered else [-1, 1]
     img = img - img.min()
-    norm_img = img / np.percentile(img, percentage_clip) * (percentage_clip/100)
+    if percentage_clip > 0:
+        norm_img = img / np.percentile(img, percentage_clip) * (percentage_clip/100)
+    if max_value > 0:
+        norm_img = img / (max_value - img.min())
     if zero_centered:
         norm_img = norm_img * 2 - 1
     return norm_img
@@ -135,13 +111,33 @@ def crop_image(df, img, roi_size_pix, name, month=None):
     return roi
 
 
-def resize_image(img, target_size):
-    img = resize(img, target_size)
+def resize_image(img, target_size, ignore_nan=False):
+    if ignore_nan:
+        mask = np.zeros_like(img)
+        mask[np.isnan(img)] = 1
+        mask = resize(mask, target_size)
+        img[np.isnan(img)] = 0
+        img = resize(img, target_size)
+        img = np.where(mask > 0.5, np.nan, img)
+    else:
+        img = resize(img, target_size)
     return img
 
 
 def flip_image(img):
     img = np.fliplr(img)
     return img
+
+
+def data_augmentation(data):
+    img_sz = data.shape
+    rotate = np.pi/12   # 15 degree
+    rotate_range = (rotate, rotate) if len(img_sz) == 3 else (rotate, rotate, rotate)
+    transforms = Compose(
+        [RandAffine(prob=0.8, rotate_range=rotate_range, padding_mode='border',),
+         RandGaussianNoise(prob=0.5),
+         RandAdjustContrast(prob=0.5)])
+    transformed_data = transforms(data)
+    return transformed_data
 
 

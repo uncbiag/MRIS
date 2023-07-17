@@ -1,21 +1,26 @@
 import os
+import shutil
 import torch
 import numpy as np
-from monai.transforms import *
 from matplotlib import pyplot as plt
 
 
-def data_augmentation(data):
-    img_sz = data.shape
-    rotate = np.pi/12   # 15 degree
-    rotate_range = (rotate, rotate) if len(img_sz) == 3 else (rotate, rotate, rotate)
+def set_device(gpu_ids):
+    has_cuda = gpu_ids[0] >= 0
+    if has_cuda:
+        device = torch.device('cuda:{}'.format(gpu_ids[0]))
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cudnn.deterministic = True
+    else:
+        device = torch.device('cpu')
+    return device
 
-    transforms = Compose(
-        [RandAffine(prob=0.8, rotate_range=rotate_range, padding_mode='border',),
-         RandGaussianNoise(prob=0.5),
-         RandAdjustContrast(prob=0.5)])
-    transformed_data = transforms(data)
-    return transformed_data
+
+def save_checkpoint(state, is_best, filename='checkpoint.pth.tar', prefix=''):
+    torch.save(state, prefix + filename)
+    if is_best:
+        print("better model")
+        shutil.copyfile(prefix + filename, prefix + 'model_best.pth.tar')
 
 
 def get_weight(distances, use_weighted):    # calculate weights according to the distance value
@@ -43,3 +48,17 @@ def plot_curve(curves, labels, save_folder, save_names):    # plot and save the 
         plt.legend(frameon=False)
         plt.savefig(os.path.join(save_folder, save_names[i]))
         plt.clf()
+
+
+def plot_image(images, title='image', save_name=None):
+    num_images = len(images)
+    plt.figure()
+    plt.suptitle(title)
+    for i in range(num_images):
+        plt.subplot(1, num_images, i+1)
+        plt.imshow(images[i], vmin=0, vmax=4)
+        plt.colorbar()
+        plt.axis('off')
+    plt.savefig(save_name)
+    plt.clf()
+

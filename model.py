@@ -2,6 +2,7 @@ import os
 import torch
 import torch.nn.init
 import torch.nn as nn
+from torch import optim
 import torchvision.models as models
 from torch.nn.utils.clip_grad import clip_grad_norm_
 
@@ -9,25 +10,19 @@ from utils import cosine_sim, l2_norm
 
 
 class Encoder(nn.Module):
-    def __init__(self, cnn_type='resnet18', pretrained=True, gpu_ids=[]):
+    def __init__(self, cnn_type='resnet18', pretrained=True):
         super(Encoder, self).__init__()
-        self.cnn = self.get_cnn(cnn_type, pretrained, gpu_ids)
+        self.cnn = self.get_cnn(cnn_type, pretrained)
         for name, p in self.cnn.named_parameters():
             p.requires_grad = True
-        self.cnn.module.fc = nn.Sequential()
+        self.cnn.fc = nn.Sequential()
 
-    def get_cnn(self, arch, pretrained, gpu_ids):
-        # Load pretrained CNN and parallelize over GPUs
+    def get_cnn(self, arch, pretrained):
         if pretrained:
             print("using pre-trained model '{}' on ImageNet".format(arch))
         else:
             print("creating model '{}'".format(arch))
-        os.environ['TORCH_HOME'] = '/playpen-raid/bqchen/code/OAIRetrieval/models'
         model = models.__dict__[arch](pretrained=pretrained)
-        if len(gpu_ids) > 0:
-            assert (torch.cuda.is_available())
-            model.to(gpu_ids[0])
-            model = nn.DataParallel(model, gpu_ids)
         return model
 
     def forward(self, img):
@@ -38,44 +33,41 @@ class Encoder(nn.Module):
 
 class TripletLoss(nn.Module):
     # adaptive: use adaptive margin, pseudo_list != None: use pseudo positive labeling
-    def __init__(self, margin=0, inverse=False):
+    def __init__(self, margin=0):
         super(TripletLoss, self).__init__()
         self.margin = margin
-        self.inverse = inverse
         self.sim = cosine_sim
 
     def forward(self, emb1, emb2):
         scores = self.sim(emb1, emb2)
-
-        # row-wise negative - positive
         diagonal1 = scores.diag()
         d1 = diagonal1.view(emb1.size(0), 1).expand_as(scores)
-        cost1 = (self.margin + scores - d1).clamp(min=0)
-
-        # column-wise negative - positive
-        diagonal2 = scores.diag()
-        d2 = diagonal2.view(1, emb1.size(0)).expand_as(scores)
-        cost2 = (self.margin + scores - d2).clamp(min=0)
-
-        # if self.inverse, add up row-wise & column-wise
-        cost = cost1 + cost2 if self.inverse else cost1
+        cost = (self.margin + scores - d1).clamp(min=0)
         return cost.sum()
 
 
 class RetrievalModel(object):
     def __init__(self, opt, pretrained):
         self.grad_clip = opt.grad_clip
+        device = torch.device('cuda:{}'.format(opt.gpu_ids[0])) if opt.gpu_ids[0] >= 0 else torch.device('cpu')
 
         # build models
-        self.data1_enc = Encoder(opt.cnn_type, pretrained[0], opt.gpu_ids)
-        self.data2_enc = Encoder(opt.cnn_type, pretrained[1], opt.gpu_ids)
+        self.data1_enc = Encoder(opt.cnn_type, pretrained[0])
+        self.data2_enc = Encoder(opt.cnn_type, pretrained[1])
+        self.data1_enc.to(device)
+        self.data2_enc.to(device)
+        if len(opt.gpu_ids) > 1:
+            self.data1_enc = nn.DataParallel(self.data1_enc, opt.gpu_ids)
+            self.data2_enc = nn.DataParallel(self.data2_enc, opt.gpu_ids)
 
         # criterion and optimizer
-        self.criterion = TripletLoss(margin=opt.margin, inverse=opt.inverse)
-        self.params1 = list(self.data1_enc.cnn.parameters())
-        self.params2 = list(self.data2_enc.cnn.parameters())
+        self.criterion = TripletLoss(margin=opt.margin)
+        self.params1 = list(self.data1_enc.parameters())
+        self.params2 = list(self.data2_enc.parameters())
         self.optimizer1 = torch.optim.AdamW(self.params1, lr=opt.learning_rate1, weight_decay=0.001)
         self.optimizer2 = torch.optim.AdamW(self.params2, lr=opt.learning_rate2, weight_decay=0.001)
+        self.scheduler1 = optim.lr_scheduler.StepLR(self.optimizer1, step_size=opt.lr_update, gamma=0.2)
+        self.scheduler2 = optim.lr_scheduler.StepLR(self.optimizer2, step_size=opt.lr_update, gamma=0.2)
 
     def state_dict(self):
         return [self.data1_enc.state_dict(), self.data2_enc.state_dict()]
